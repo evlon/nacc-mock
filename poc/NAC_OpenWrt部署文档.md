@@ -79,6 +79,53 @@ scp nac_openwrt.init.d root@192.168.1.1:/etc/init.d/nac_openwrt
 ssh root@192.168.1.1 "chmod +x /etc/init.d/nac_openwrt"
 ```
 
+### 3.35 开机自启（procd 规范，重要）
+
+```bash
+# 部署 init.d 脚本 + 启用自启
+scp nac_openwrt.init.d root@<ROUTER_IP>:/etc/init.d/nac_openwrt
+ssh root@<ROUTER_IP> "chmod +x /etc/init.d/nac_openwrt && /etc/init.d/nac_openwrt enable"
+
+# 验证自启（应看到 S99nac_openwrt 软链）
+ssh root@<ROUTER_IP> "ls -la /etc/rc.d/ | grep nac"
+```
+
+> ⚠️ **关键坑（实测踩过）**：K-WRT 25.12 / 新版 OpenWrt 用 **procd** 作为 init 系统。
+> init.d 脚本**必须用 procd 规范写法**：
+> ```sh
+> #!/bin/sh /etc/rc.common
+> START=99
+> USE_PROCD=1
+> start_service() {
+>     procd_open_instance
+>     procd_set_param command /bin/sh /root/nac_openwrt.sh run
+>     procd_set_param respawn
+>     procd_set_param stdout 1
+>     procd_set_param stderr 1
+>     procd_close_instance
+> }
+> ```
+> **不能用旧式写法**（自定义 `start()` + `( ... & )` 后台）——那样软链虽然
+> 存在、`enabled` 检查也通过，但开机时 procd 会清理孤儿进程，导致
+> **「重启后不自启」**（实测：旧写法重启后 `ps` 无进程、`/var/run/*.pid` 不存在）。
+>
+> procd 版还自带 `respawn`（崩溃自动重启），比旧写法更健壮。
+
+**验证自启是否真的生效**（必须真实重启验证）：
+
+```bash
+ssh root@<ROUTER_IP> "reboot"          # 等待 ~60-105 秒
+# 重启后检查：
+ssh root@<ROUTER_IP> "ps w | grep nac_openwrt.sh"
+# 期望：/bin/sh /root/nac_openwrt.sh run  （有输出即自启成功）
+
+ssh root@<ROUTER_IP> "logread | grep nac_openwrt"
+# 期望：procd: /etc/rc.d/S99nac_openwrt: ========== NAC OpenWrt 客户端启动 ==========
+```
+
+> 注：procd 接管后，脚本 stdout/stderr 进 **syslog**（`logread` 查看），
+> 不再写 `/var/log/nac_openwrt.log`（且 `/var/log` 是 tmpfs，重启清空）。
+
 ### 3.4 配置
 
 编辑 `/root/nac_openwrt.sh` 的 CONFIG 区：
