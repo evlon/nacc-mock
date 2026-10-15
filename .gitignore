@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 临时/日志
+*.log
+*.tmp
+*.pcapng
+*.pcap
+.DS_Store
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 敏感凭据（若本地调试需要真实值，放这里，不入库）
+.env
+credentials.local.*
