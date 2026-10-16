@@ -128,19 +128,38 @@ def get_driver_binding_state():
     return []
 
 
-def kill_processes():
-    """杀所有 NACC 相关进程。"""
-    procs = get_running_processes()
-    if not procs:
-        print("  无 NACC 相关进程在运行")
-        return
-    for pid, name in procs.items():
-        try:
-            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                           capture_output=True, timeout=30)
-            print(f"  已杀 {name} (PID {pid})")
-        except Exception as e:
-            print(f"  [!] 杀 {name} (PID {pid}) 失败: {e}")
+def kill_processes(confirm_dead=True, max_rounds=5):
+    """杀所有 NACC 相关进程。
+
+    confirm_dead=True 时循环确认守护进程(CCMon/StartCCMon/NACCControl)确实
+    死透（防止 StartCCMon 或残留机制在 taskkill 间隙重新拉起 CCMon）。
+    """
+    for _ in range(max_rounds):
+        procs = get_running_processes()
+        if not procs:
+            return True
+        for pid, name in procs.items():
+            try:
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                               capture_output=True, timeout=30)
+                print(f"  已杀 {name} (PID {pid})")
+            except Exception as e:
+                print(f"  [!] 杀 {name} (PID {pid}) 失败: {e}")
+        if not confirm_dead:
+            return bool(get_running_processes()) is False
+        # 确认是否还有守护进程残留（NACC.exe 可能被服务立刻拉起，但守护进程是关键）
+        time.sleep(0.3)
+        remaining = get_running_processes()
+        guardians = [n for n in remaining.values() if n in ("CCMon.exe", "StartCCMon.exe", "NACCControl.exe")]
+        if not guardians:
+            return True
+        print(f"  [守护进程仍残留: {', '.join(guardians)}]，继续杀 ...")
+    # 多轮后仍有残留
+    remaining = get_running_processes()
+    if remaining:
+        print(f"  [!] 警告：以下进程杀不死: {', '.join(remaining.values())}")
+        return False
+    return True
 
 
 def disable_service():
@@ -201,18 +220,27 @@ def bind_driver():
 
 
 def do_stop():
-    """关停 NACC（完整：进程 + 服务 + 解除驱动绑定）。"""
+    """关停 NACC（完整：进程 + 服务 + 解除驱动绑定）。
+
+    【关键顺序修正 2026-10-12】必须「先杀守护进程，再禁服务」！
+    逆向 CCMon.exe 发现：CCMon 有每 500ms 周期的服务自愈（FUN_004014d1），
+    会检测 NACCService 的 start_type，若 != AUTO(2) 就 ChangeServiceConfigA
+    改回 AUTO，若 STOPPED 就 StartServiceA 拉起。因此若「先禁服务再杀 CCMon」，
+    CCMon 会在被杀前的自愈周期内把服务改回 AUTO 并拉起，导致服务又起来。
+    正确顺序：先杀掉所有守护进程（CCMon/StartCCMon/NACCControl）斩断自愈源，
+    再杀 NACC.exe，最后禁服务（此时已无 CCMon 改回）。
+    """
     print("=" * 60)
     print("NACC 自由关停（完整模式）")
     print("=" * 60)
 
-    # 步骤 1：禁用服务（斩断守护链）
-    print("\n[1/3] 禁用 NACCService ...")
-    disable_service()
-
-    # 步骤 2：杀进程（守护链全部成员）
-    print("\n[2/3] 杀 NACC 相关进程 ...")
+    # 步骤 1：先杀所有守护进程（斩断 CCMon 的 500ms 服务自愈源）
+    print("\n[1/3] 杀守护进程（CCMon/StartCCMon/NACCControl）+ NACC.exe ...")
     kill_processes()
+
+    # 步骤 2：杀守护进程后再禁用服务（此时无 CCMon 改回 AUTO）
+    print("\n[2/3] 禁用 NACCService ...")
+    disable_service()
 
     # 步骤 3：解除驱动绑定（安全，不断网）
     print("\n[3/3] 解除 ndisnac 驱动绑定 ...")
