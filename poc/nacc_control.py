@@ -8,24 +8,42 @@ NACC 自由关停补丁（安全评估）
 核心机制（基于逆向 + 实测验证）：
     1. NACC 自保护守护链：
        - NACCService（LocalSystem 服务）→ NACC.exe（主进程）
-       - CCMon.exe（守护进程，定时轮询 Process32First/Next 枚举进程，
-         发现 NACC.exe 不在就 StartServiceA(NACCService) 重新拉起）
-       - 自启动：HKLM\...\Run\NACCControl = NACCControl.exe
+       - CCMon.exe（守护进程，每 500ms 周期自愈 FUN_004014d1：
+         检测 NACCService 的 start_type，!=AUTO 就 ChangeServiceConfigA 改回，
+         STOPPED 就 StartServiceA 拉起；服务不存在则 CreateServiceA 重建）
+       - StartCCMon.exe → 拉起 CCMon.exe（CCMon9x.exe 为 9x 变体）
+       - 开机自启链：HKLM\...\Run\NACCControl → NACCControl.exe
+         → 拉起 NACC.exe / StartCCMon.exe → CCMon.exe → 自愈拉起服务
+         （NACC.exe 与 NACCControl.exe 都会用 RegSetValueExW 重建该 Run 键）
     2. 关停的正确顺序（关键，否则被守护拉起）：
-       ① 先禁用服务 sc config NACCService start= disabled
-          （让 CCMon 的 StartServiceA 失败，斩断守护链）
-       ② 同时杀 NACC.exe / CCMon.exe / NACCControl.exe
-       ③ 解除 ndisnac 驱动对网卡的绑定（等效手动取消勾选，不断网）
-    3. 【重要教训】不要 sc stop ndisnac/tdinac 驱动！
+       ① 清除服务失败恢复动作（防止 SCM 自动重启服务）
+       ② 【先杀守护进程】NACC.exe / CCMon.exe / NACCControl.exe / StartCCMon.exe
+          （CCMon 有 500ms 自愈，必须先斩断守护源，且循环确认死透）
+       ③ 再禁用服务 sc config NACCService start= disabled
+       ④ 解除 ndisnac 驱动对网卡的绑定（等效手动取消勾选，不断网）
+       * 若「先禁服务再杀进程」，CCMon 会在被杀前的自愈周期内把服务改回
+         AUTO 并拉起，导致服务又起来（这是早期 stop 失效的根因）。
+    3. 【持久禁用】stop 只关停「这一次」，重启后 Run 键仍会拉起整条链：
+       - disable 命令额外删除 Run 自启项 + 禁服务 + 清失败动作 + 解绑驱动，
+         并备份到 nacc_autostart_backup.json，重启后 NACC 不再自启。
+       - enable 命令从备份完整还原。
+       * 删 Run 键必须在【杀光进程之后】，否则 NACC.exe 会立刻重建它。
+    4. 【重要教训】不要 sc stop ndisnac/tdinac 驱动！
        - ndisnac 是 NDIS 过滤驱动，sc stop 会导致网卡网络栈异常断网
        - tdinac 会卡在 Stop Pending 僵尸状态，只能重启恢复
        - 正确做法是用 Disable-NetAdapterBinding 解除绑定（安全、不断网）
 
 用法：
-    python nacc_control.py stop      # 关停 NACC（进程 + 服务 + 解除驱动绑定）
+    python nacc_control.py disable   # 【持久禁用】杀进程+禁服务+删Run键+解绑驱动（重启也不自启）
+    python nacc_control.py enable    # 还原所有自启动项（从备份恢复，重启后重新自启）
+    python nacc_control.py stop      # 临时关停（进程+服务+解绑驱动，但重启仍会自启）
     python nacc_control.py start     # 恢复 NACC（服务 + 进程 + 恢复驱动绑定）
     python nacc_control.py status    # 查看当前状态
     python nacc_control.py kill      # 仅杀进程（不解除驱动绑定，最轻量）
+
+stop 与 disable 的区别：
+    stop    = 只关停「这一次」，开机自启入口（Run 键/服务自启）未清除，重启后会自启。
+    disable = 额外清除全部开机自启入口并备份，重启后也不会自启；用 enable 还原。
 
 注意：需要管理员权限。
 """
@@ -33,7 +51,10 @@ NACC 自由关停补丁（安全评估）
 import subprocess
 import sys
 import os
+import re
 import time
+import json
+import winreg  # Windows 注册表操作（本工具仅 Windows）
 
 # 修复 GBK 控制台无法输出 emoji 的问题
 if sys.stdout.encoding and sys.stdout.encoding.lower() in ("gbk", "cp936"):
@@ -47,6 +68,36 @@ TARGET_PROCESSES = ["NACC.exe", "CCMon.exe", "NACCControl.exe", "StartCCMon.exe"
 SERVICE_NAME = "NACCService"
 # NDIS 过滤驱动组件 ID（网卡绑定里的显示名 "ndisnac Driver" 对应 ComponentID）
 DRIVER_COMPONENT_ID = "ndisnac"
+
+# ---------------------------------------------------------------------------
+# 开机自启入口（持久禁用用）
+#   来源：逆向 Setup.ini + NACC.exe/NACCControl.exe 逆向
+#     ① 服务 NACCService（二进制 NACC.exe，AUTO_START）
+#     ② HKLM\Software\Microsoft\Windows\CurrentVersion\Run\NACCControl = NACCControl.exe
+#        （NACC.exe / NACCControl.exe 都会用 RegSetValueExW 重建此键）
+#     ③ 计划任务 / 启动文件夹（如有）
+#   注意：必须在【杀光进程之后】再删 Run 键，否则 NACC.exe 会立刻重建。
+# ---------------------------------------------------------------------------
+AUTOSTART_RE = r"(?i)(NACC|CCMon|StartCCMon)"
+BACKUP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "nacc_autostart_backup.json")
+
+# 需要检查的 Run/RunOnce 注册表位置（含 32/64 位视图）
+RUN_KEYS = [
+    ("HKLM", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
+    ("HKLM", r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"),
+    ("HKLM", r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run"),
+    ("HKLM", r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce"),
+    ("HKCU", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
+    ("HKCU", r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"),
+    ("HKCU", r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run"),
+    ("HKCU", r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce"),
+]
+_HIVES = {"HKLM": winreg.HKEY_LOCAL_MACHINE, "HKCU": winreg.HKEY_CURRENT_USER}
+
+# NACCService 的注册表 Start 值语义：0=Boot 1=System 2=Auto 3=Manual 4=Disabled
+SERVICE_START_DISABLED = 4
+SERVICE_START_AUTO = 2
 
 
 def is_admin() -> bool:
@@ -219,9 +270,324 @@ def bind_driver():
     return False
 
 
+# ===========================================================================
+# 持久禁用：自启动项枚举 / 备份 / 移除 / 恢复
+# ===========================================================================
+
+def get_service_start_value():
+    """读取 NACCService 的注册表 Start 值（0=Boot..2=Auto..4=Disabled）。"""
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Services\%s" % SERVICE_NAME,
+            0, winreg.KEY_READ,
+        ) as k:
+            return winreg.QueryValueEx(k, "Start")[0]
+    except OSError:
+        return None
+
+
+def enumerate_run_entries():
+    """枚举 Run/RunOnce 中指向 NACC/CCMon 的项。"""
+    found = []
+    for hive, sub in RUN_KEYS:
+        try:
+            with winreg.OpenKey(_HIVES[hive], sub, 0, winreg.KEY_READ) as k:
+                i = 0
+                while True:
+                    try:
+                        name, val, _ = winreg.EnumValue(k, i)
+                    except OSError:
+                        break
+                    i += 1
+                    if isinstance(val, str) and re.search(AUTOSTART_RE, val):
+                        found.append({"hive": hive, "subkey": sub,
+                                      "name": name, "value": val})
+        except OSError:
+            continue
+    return found
+
+
+def remove_run_entry(entry):
+    """从注册表删除一个 Run 项。"""
+    try:
+        with winreg.OpenKey(_HIVES[entry["hive"]], entry["subkey"], 0,
+                            winreg.KEY_SET_VALUE) as k:
+            winreg.DeleteValue(k, entry["name"])
+        return True
+    except OSError as e:
+        print(f"      [!] 删除失败 {entry['name']}: {e}")
+        return False
+
+
+def restore_run_entry(entry):
+    """恢复一个 Run 项到注册表。"""
+    try:
+        with winreg.CreateKeyEx(_HIVES[entry["hive"]], entry["subkey"], 0,
+                                winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, entry["name"], 0, winreg.REG_SZ, entry["value"])
+        return True
+    except OSError as e:
+        print(f"      [!] 恢复失败 {entry['name']}: {e}")
+        return False
+
+
+def enumerate_scheduled_tasks():
+    """枚举 Actions 指向 NACC/CCMon 的计划任务。"""
+    ps = ("$ErrorActionPreference='SilentlyContinue';"
+          "Get-ScheduledTask | Where-Object { "
+          "($_.Actions | ForEach-Object { $_.Execute }) -match 'NACC|CCMon' } | "
+          "ForEach-Object { $_.TaskPath + '|' + $_.TaskName + '|' + $_.State }")
+    code, out, _ = run_cmd(["powershell", "-NoProfile", "-Command", ps])
+    tasks = []
+    for line in out.splitlines():
+        parts = line.strip().split("|")
+        if len(parts) >= 3 and parts[1]:
+            tasks.append({"path": parts[0], "name": parts[1], "state": parts[2]})
+    return tasks
+
+
+def disable_task(task):
+    """禁用计划任务。"""
+    code, out, err = run_cmd([
+        "powershell", "-NoProfile", "-Command",
+        "Disable-ScheduledTask -TaskPath '%s' -TaskName '%s' | Out-Null"
+        % (task["path"], task["name"]),
+    ])
+    return code == 0
+
+
+def enable_task(task):
+    """重新启用计划任务。"""
+    code, out, err = run_cmd([
+        "powershell", "-NoProfile", "-Command",
+        "Enable-ScheduledTask -TaskPath '%s' -TaskName '%s' | Out-Null"
+        % (task["path"], task["name"]),
+    ])
+    return code == 0
+
+
+def get_startup_dirs():
+    """返回(当前用户, 所有用户)两个启动文件夹路径。"""
+    dirs = []
+    appdata = os.environ.get("APPDATA", "")
+    programdata = os.environ.get("ProgramData", "")
+    if appdata:
+        dirs.append(os.path.join(
+            appdata, r"Microsoft\Windows\Start Menu\Programs\Startup"))
+    if programdata:
+        dirs.append(os.path.join(
+            programdata, r"Microsoft\Windows\Start Menu\Programs\Startup"))
+    return dirs
+
+
+def enumerate_startup_shortcuts():
+    """枚举启动文件夹里文件名匹配 NACC/CCMon 的项。"""
+    found = []
+    for d in get_startup_dirs():
+        if os.path.isdir(d):
+            try:
+                for f in os.listdir(d):
+                    if re.search(AUTOSTART_RE, f):
+                        found.append({"dir": d, "file": f})
+            except OSError:
+                pass
+    return found
+
+
+def clear_service_recovery():
+    """清除 NACCService 的失败恢复动作（防止杀进程后 SCM 自动重启服务）。"""
+    code, out, err = run_cmd(["sc", "failure", SERVICE_NAME, "reset=", "0",
+                              "actions=", '""'])
+    if code == 0:
+        print("  已清除 NACCService 的失败恢复动作（SCM 不再自动重启它）")
+        return True
+    print(f"  [i] 清除失败恢复动作返回: {err.strip() or out.strip()}")
+    return False
+
+
+def save_backup(data):
+    """把自启动项备份写入 JSON 文件。"""
+    try:
+        with open(BACKUP_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except OSError as e:
+        print(f"  [!] 备份失败: {e}")
+        return False
+
+
+def load_backup():
+    """读取自启动项备份。"""
+    try:
+        with open(BACKUP_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def do_disable():
+    """持久禁用 NACC：重启后也不再自启。
+
+    与 stop 的区别：stop 只是「这次关停」，本命令额外清除所有开机自启入口，
+    使得重启后 NACC 不会被拉起。可用 enable 完整还原。
+    """
+    print("=" * 60)
+    print("NACC 持久禁用（禁用后重启也不再自启）")
+    print("=" * 60)
+    print("\n将清除以下开机自启入口（并备份以便还原）：")
+    print("  ① 服务 NACCService：start=disabled + 清除失败恢复动作")
+    print("  ② 注册表 Run/RunOnce 里的 NACCControl 等自启项")
+    print("  ③ 计划任务 / 启动文件夹中的 NACC 相关项（如有）")
+    print("  ④ 解除 ndisnac 驱动绑定（持久生效）")
+    print(f"\n备份文件：{BACKUP_FILE}")
+    print("还原命令：python nacc_control.py enable\n")
+
+    backup = {"run_entries": [], "tasks": [], "startup": [],
+              "service_start": None, "time": time.strftime("%Y-%m-%d %H:%M:%S")}
+
+    # --- [1/6] 枚举并备份当前自启动项 ---
+    print("[1/6] 枚举并备份当前自启动项 ...")
+    run_entries = enumerate_run_entries()
+    for e in run_entries:
+        print(f"      Run: [{e['hive']}\\{e['subkey']}] {e['name']} = {e['value']}")
+    if not run_entries:
+        print("      (未发现 NACC 相关的 Run 项)")
+    backup["run_entries"] = run_entries
+
+    tasks = enumerate_scheduled_tasks()
+    for t in tasks:
+        print(f"      计划任务: {t['path']}{t['name']} ({t['state']})")
+    backup["tasks"] = tasks
+
+    startup = enumerate_startup_shortcuts()
+    for s in startup:
+        print(f"      启动文件夹: {s['file']}  ({s['dir']})")
+    backup["startup"] = startup
+
+    st = get_service_start_value()
+    backup["service_start"] = st
+    print(f"      NACCService 原 Start 值: {st} "
+          f"({'Auto' if st == SERVICE_START_AUTO else st})")
+    save_backup(backup)
+
+    # --- [2/6] 清除服务失败恢复动作（先做，防止杀进程后被 SCM 拉起） ---
+    print("\n[2/6] 清除 NACCService 失败恢复动作 ...")
+    clear_service_recovery()
+
+    # --- [3/6] 杀光所有进程（含守护），必须在删 Run 键之前 ---
+    print("\n[3/6] 杀光 NACC 相关进程（含 CCMon/StartCCMon/NACCControl）...")
+    kill_processes()
+
+    # --- [4/6] 禁用服务 ---
+    print("\n[4/6] 禁用 NACCService（start=disabled）...")
+    disable_service()
+
+    # --- [5/6] 移除自启动项（此时进程已死，NACC.exe 无法重建 Run 键） ---
+    print("\n[5/6] 移除自启动项 ...")
+    removed = 0
+    for e in run_entries:
+        if remove_run_entry(e):
+            print(f"      已移除 Run: {e['name']}")
+            removed += 1
+    for t in tasks:
+        if disable_task(t):
+            print(f"      已禁用计划任务: {t['path']}{t['name']}")
+    print(f"      共移除 {removed} 个 Run 项")
+
+    # --- [6/6] 解除驱动绑定 + 校验 ---
+    print("\n[6/6] 解除 ndisnac 驱动绑定 ...")
+    unbind_driver()
+
+    # 最终校验：再杀一次残留（防自愈窗口），并确认自启动项已清空
+    print("\n" + "-" * 40)
+    print("最终校验：")
+    time.sleep(1)
+    kill_processes(confirm_dead=True, max_rounds=3)
+    left = enumerate_run_entries()
+    sv = get_service_start_value()
+    ok = True
+    if left:
+        print(f"  [!] 仍有 Run 项残留: {[x['name'] for x in left]}")
+        ok = False
+    else:
+        print("  [OK] Run 自启动项已清空")
+    if sv == SERVICE_START_DISABLED:
+        print("  [OK] NACCService 已禁用（Start=4）")
+    else:
+        print(f"  [!] NACCService Start 值 = {sv}（期望 4）")
+        ok = False
+    procs = get_running_processes()
+    if procs:
+        print(f"  [!] 仍有进程: {list(procs.values())}")
+        ok = False
+    else:
+        print("  [OK] 无 NACC 相关进程")
+
+    print("\n" + "=" * 60)
+    if ok:
+        print("持久禁用完成：重启后 NACC 将不会自动启动。")
+    else:
+        print("持久禁用部分完成：上面有 [!] 项，建议再执行一次 disable。")
+    print("可用 `python nacc_control.py enable` 还原所有自启动项。")
+    print("=" * 60)
+
+
+def do_enable():
+    """从备份还原所有自启动项，恢复正常（重启后会自启）。"""
+    print("=" * 60)
+    print("NACC 还原自启动（恢复被 disable 清除的入口）")
+    print("=" * 60)
+
+    backup = load_backup()
+    if not backup:
+        print(f"\n[!] 未找到备份文件：{BACKUP_FILE}")
+        print("    将按默认方式恢复：服务设为自动 + 启动 + 绑定驱动。")
+        print("    （Run 键需由 NACC 自身重启后重建）")
+        backup = {"run_entries": [], "tasks": [], "startup": [],
+                  "service_start": SERVICE_START_AUTO}
+
+    # --- [1/5] 还原 Run 项 ---
+    print("\n[1/5] 还原注册表自启动项 ...")
+    run_entries = backup.get("run_entries") or []
+    if run_entries:
+        for e in run_entries:
+            if restore_run_entry(e):
+                print(f"      已还原 Run: [{e['hive']}] {e['name']} = {e['value']}")
+    else:
+        print("      (备份中无 Run 项)")
+
+    # --- [2/5] 还原计划任务 ---
+    tasks = backup.get("tasks") or []
+    if tasks:
+        print("\n[2/5] 还原计划任务 ...")
+        for t in tasks:
+            if enable_task(t):
+                print(f"      已启用计划任务: {t['path']}{t['name']}")
+    else:
+        print("\n[2/5] 无计划任务需还原")
+
+    # --- [3/5] 恢复驱动绑定 ---
+    print("\n[3/5] 恢复 ndisnac 驱动绑定 ...")
+    bind_driver()
+
+    # --- [4/5] 恢复服务为自动并启动 ---
+    print("\n[4/5] 恢复并启动 NACCService ...")
+    enable_service()
+    start_service()
+
+    # --- [5/5] 等待拉起 ---
+    print("\n[5/5] 等待进程拉起 ...")
+    time.sleep(3)
+    show_status_inline()
+
+    print("=" * 60)
+    print("已还原。若 Run 项缺失，NACC 首次运行时会自行重建 NACCControl 自启键。")
+    print("=" * 60)
+
+
 def do_stop():
     """关停 NACC（完整：进程 + 服务 + 解除驱动绑定）。
-
     【关键顺序修正 2026-10-12】必须「先杀守护进程，再禁服务」！
     逆向 CCMon.exe 发现：CCMon 有每 500ms 周期的服务自愈（FUN_004014d1），
     会检测 NACCService 的 start_type，若 != AUTO(2) 就 ChangeServiceConfigA
@@ -351,13 +717,13 @@ def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
 
     # 帮助信息无需管理员
-    if cmd not in ("stop", "start", "kill", "status"):
+    if cmd not in ("stop", "start", "kill", "status", "disable", "enable"):
         print(__doc__)
         sys.exit(0)
 
-    # status 无需管理员；stop/start/kill 需要
+    # status 无需管理员；其余命令需要
     if cmd != "status" and not is_admin():
-        print("[!] 需要管理员权限（杀进程/改服务/解除驱动绑定需提权）")
+        print("[!] 需要管理员权限（杀进程/改服务/改注册表/解除驱动绑定需提权）")
         print("    请用管理员身份运行。")
         sys.exit(1)
 
@@ -369,6 +735,10 @@ def main():
         do_kill()
     elif cmd == "status":
         do_status()
+    elif cmd == "disable":
+        do_disable()
+    elif cmd == "enable":
+        do_enable()
 
 
 if __name__ == "__main__":

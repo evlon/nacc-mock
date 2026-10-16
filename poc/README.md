@@ -76,7 +76,7 @@ g{device_id}_h{GUID}~8xxxm{MAC}_8xxxi{IPv4}_8xxxj{IPv6}_8xxxj{IPv6}...
 | `nac_client_mvp.py` | **主程序（Windows）**：登录 + 签名 + 上报合规 + 心跳 + 水印打标（13 项功能） |
 | `nac_openwrt.sh` | **主程序（OpenWrt 路由器）**：登录 + 心跳 + 上报 + 签名 + 水印（本次实测打通） |
 | `nac_openwrt.init.d` | OpenWrt 开机自启脚本 |
-| `nacc_control.py` | **自由关停补丁**：关停/恢复 NACC 客户端（进程+服务+驱动解绑，破解自保护守护链） |
+| `nacc_control.py` | **自由关停补丁**：关停/持久禁用/恢复 NACC 客户端（进程+服务+驱动解绑+清除开机自启入口，破解自保护守护链） |
 | `nac_compliance_bypass.ps1` | 合规绕过脚本（注册表伪造红名单软件，check/inject/verify/rollback） |
 | `verify_watermark.py` | 水印验证工具：检查 TTL/DSCP 是否真正打上（阻断启用前的验证） |
 | `verify_signature.py` / `verify_sig_shell.sh` | 签名算法验证（Python / shell 双版本，用于比对） |
@@ -133,28 +133,55 @@ python simulate_block.py stop     # 停止模拟阻断
 
 ```powershell
 # 管理员 PowerShell 运行
-python nacc_control.py stop      # 关停 NACC（进程+服务+解除驱动绑定）
+python nacc_control.py disable   # 【持久禁用】重启后也不再自启（推荐）
+python nacc_control.py enable    # 还原所有自启动项，恢复正常
+python nacc_control.py stop      # 临时关停（重启后仍会自启）
 python nacc_control.py start     # 恢复 NACC（服务+进程+恢复驱动绑定）
 python nacc_control.py status    # 查看状态（无需管理员）
 python nacc_control.py kill      # 仅杀进程（最轻量，会被守护拉起）
 ```
 
+> **`stop` 与 `disable` 的区别**（重要）：
+> `stop` 只关停「这一次」，**开机自启入口未清除**，重启电脑后 NACC 会重新自启；
+> `disable` 额外清除全部开机自启入口并备份，**重启后也不会自启**，用 `enable` 还原。
+
 **破解的自保护守护链**（逆向 + 实测）：
 
 ```
-自启动 Run 键 → NACCControl.exe（界面）
+开机 → HKLM\...\Run\NACCControl → NACCControl.exe（界面）
+     → 拉起 NACC.exe（服务）/ StartCCMon.exe → CCMon.exe
 NACCService（LocalSystem，Start=2）→ NACC.exe（主进程）
-CCMon.exe（守护：定时轮询枚举进程，发现 NACC.exe 不在就 StartServiceA 拉起）
+CCMon.exe（守护：每 500ms 自愈 FUN_004014d1，检测服务 start_type 并
+          改回 AUTO / StartServiceA 拉起；服务被删则 CreateServiceA 重建）
 ```
 
-**关停要点**：先 `sc config NACCService start= disabled`（让守护的 `StartServiceA` 失败、斩断守护链）→ 杀进程 → 解绑驱动。
+**关停要点（顺序关键）**：
+① 清失败恢复动作 → ② **先杀守护进程**（CCMon/StartCCMon/NACCControl/NACC.exe，
+循环确认死透）→ ③ 再 `sc config NACCService start= disabled` → ④ 解绑驱动。
+
+> ⚠️ 顺序不能颠倒：若「先禁服务再杀进程」，CCMon 会在被杀前的 500ms
+> 自愈周期内把服务改回 AUTO 并拉起（这是早期 `stop` 失效的根因）。
+
+**持久禁用（`disable`）清除的自启入口**：
+
+| 入口 | 处理方式 |
+|------|---------|
+| 服务 `NACCService` | `start=disabled` + 清除失败恢复动作 |
+| `HKLM\...\Run\NACCControl` 等 Run/RunOnce 项 | 删除（备份到 `nacc_autostart_backup.json`） |
+| Run/RunOnce（HKLM/HKCU，含 WOW6432Node） | 全量扫描含 NACC/CCMon 的项一并清除 |
+| 计划任务 / 启动文件夹 | 扫描并禁用/移除（如有） |
+| `ndisnac` 驱动绑定 | `Disable-NetAdapterBinding`（持久生效） |
+
+> ⚠️ 删 Run 键必须在**杀光进程之后**：`NACC.exe` 与 `NACCControl.exe` 都会用
+> `RegSetValueExW` 重建该键，进程没死就删会被立刻写回。
 
 > ⚠️ **关键教训**：不要 `sc stop` 驱动！`ndisnac.sys` 是 NDIS 过滤驱动，
 > `sc stop` 会导致断网 + `tdinac` 卡 Stop Pending 僵尸状态（只能重启恢复）。
 > 正确做法是用 `Disable-NetAdapterBinding` 解除驱动对网卡的绑定
 > （等效手动取消网卡属性里的勾选，安全、不断网、可逆）。
 
-**实测结果**：`stop → start` 完整闭环验证通过，无断网（仅毫秒级网卡重连）。
+**实测结果**：`stop → start` 完整闭环验证通过，无断网（仅毫秒级网卡重连）；
+`disable/enable` 的枚举-移除-恢复闭环已在 HKCU 仿真 Run 项上验证通过。
 
 ---
 
